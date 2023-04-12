@@ -1,0 +1,744 @@
+#version 450 core
+layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(binding = 7,rgba32f) uniform image2D frameTexture;
+layout(binding=1)uniform sampler2D PositionWithDepth;
+layout(binding=0)uniform sampler2D NormalWithMaterial;
+layout(binding=2)uniform sampler2D hdrMap;
+layout(binding=3)uniform sampler2D hdrCache;
+uniform float frameCounter; 
+uniform mat4 u_view;
+uniform mat4 u_projection;
+uniform vec3 eye;
+uniform int hdrResolution;
+uniform float rdSeed[];
+vec2 TexCoords = gl_GlobalInvocationID.xy/512.0;
+int rdCnt = 0;
+#define PI              3.1415926
+#define INF             114514.0
+
+
+
+// 结构体定义
+struct Material {
+    vec3 emissive;  
+    float roughness;// 作为光源时的发光颜色
+    vec3 baseColor;
+    float metallic;
+
+
+};
+struct Triangle {
+      
+	vec4 p1withTriangleID;
+	vec4 n1withMaterialID;
+	vec4 p2withTriangleID;
+	vec4 n2withMaterialID;
+	vec4 p3withTriangleID;
+	vec4 n3withMaterialID;
+};
+// BVH 树节点
+struct BVHNode {
+    int left;           // 左子树
+    int right;          // 右子树
+    int n;              // 包含三角形数目
+    int index;          // 三角形索引
+    vec4 AA, BB;        // 碰撞盒
+};
+struct HitResult{
+    bool isHit;             // 是否命中
+    bool isInside;          // 是否从内部命中
+    float dis;         // 与交点的距离
+    vec3 hitPoint;          // 光线命中点
+    vec3 normal;            // 命中点法线
+    vec3 viewDir;           // 击中该点的光线的方向
+    Material material;      // 命中点的表面材质
+};
+// 光线
+struct Ray {
+    vec3 startPoint;
+    vec3 direction;
+};
+
+//变量
+layout(std430,binding=2) buffer traianglessbo{
+
+    Triangle ts[];
+
+};
+
+layout(std430,binding=3) buffer bvhssbo{
+    BVHNode bvh[];
+};
+
+layout(std430,binding=4) buffer materialssbo{
+    Material materialArray[];
+};
+float RadicalInverse_VdC(uint bits) 
+{
+    bits = (bits << 16u) | (bits >> 16u);
+    bits = ((bits & 0x55555555u) << 1u) | ((bits & 0xAAAAAAAAu) >> 1u);
+    bits = ((bits & 0x33333333u) << 2u) | ((bits & 0xCCCCCCCCu) >> 2u);
+    bits = ((bits & 0x0F0F0F0Fu) << 4u) | ((bits & 0xF0F0F0F0u) >> 4u);
+    bits = ((bits & 0x00FF00FFu) << 8u) | ((bits & 0xFF00FF00u) >> 8u);
+    return float(bits) * 2.3283064365386963e-10; // / 0x100000000
+}
+// ----------------------------------------------------------------------------
+vec2 Hammersley(uint i, uint N)
+{
+    return vec2(float(i)/float(N), RadicalInverse_VdC(i));
+}  
+
+float misMixWeight(float a, float b) {
+    float t = a * a;
+    return t / (b*b + t);
+}
+
+
+uint seed = uint(
+    uint(gl_GlobalInvocationID.x)  * uint(1973) + 
+    uint(gl_GlobalInvocationID.y) * uint(9277) + 
+    uint(frameCounter) * uint(26699)) | uint(1);
+
+uint wang_hash(inout uint seed) {
+    seed = uint(seed ^ uint(61)) ^ uint(seed >> uint(16));
+    seed *= uint(9);
+    seed = seed ^ (seed >> 4);
+    seed *= uint(0x27d4eb2d);
+    seed = seed ^ (seed >> 15);
+    return seed;
+}
+ 
+float rand() {
+    return float(wang_hash(seed)) / 4294967296.0;
+}
+
+
+const uint V[8*32] = {
+    2147483648u,1073741824u,536870912u,268435456u,134217728u,67108864u,33554432u,16777216u,8388608u,4194304u,2097152u,1048576u,524288u,262144u,131072u,65536u,32768u,16384u,8192u,4096u,2048u,1024u,512u,256u,128u,64u,32u,16u,8u,4u,2u,1u,2147483648u,3221225472u,2684354560u,4026531840u,2281701376u,3422552064u,2852126720u,4278190080u,2155872256u,3233808384u,2694840320u,4042260480u,2290614272u,3435921408u,2863267840u,4294901760u,2147516416u,3221274624u,2684395520u,4026593280u,2281736192u,3422604288u,2852170240u,4278255360u,2155905152u,3233857728u,2694881440u,4042322160u,2290649224u,3435973836u,2863311530u,4294967295u,2147483648u,3221225472u,1610612736u,2415919104u,3892314112u,1543503872u,2382364672u,3305111552u,1753219072u,2629828608u,3999268864u,1435500544u,2154299392u,3231449088u,1626210304u,2421489664u,3900735488u,1556135936u,2388680704u,3314585600u,1751705600u,2627492864u,4008611328u,1431684352u,2147543168u,3221249216u,1610649184u,2415969680u,3892340840u,1543543964u,2382425838u,3305133397u,2147483648u,3221225472u,536870912u,1342177280u,4160749568u,1946157056u,2717908992u,2466250752u,3632267264u,624951296u,1507852288u,3872391168u,2013790208u,3020685312u,2181169152u,3271884800u,546275328u,1363623936u,4226424832u,1977167872u,2693105664u,2437829632u,3689389568u,635137280u,1484783744u,3846176960u,2044723232u,3067084880u,2148008184u,3222012020u,537002146u,1342505107u,2147483648u,1073741824u,536870912u,2952790016u,4160749568u,3690987520u,2046820352u,2634022912u,1518338048u,801112064u,2707423232u,4038066176u,3666345984u,1875116032u,2170683392u,1085997056u,579305472u,3016343552u,4217741312u,3719483392u,2013407232u,2617981952u,1510979072u,755882752u,2726789248u,4090085440u,3680870432u,1840435376u,2147625208u,1074478300u,537900666u,2953698205u,2147483648u,1073741824u,1610612736u,805306368u,2818572288u,335544320u,2113929216u,3472883712u,2290089984u,3829399552u,3059744768u,1127219200u,3089629184u,4199809024u,3567124480u,1891565568u,394297344u,3988799488u,920674304u,4193267712u,2950604800u,3977188352u,3250028032u,129093376u,2231568512u,2963678272u,4281226848u,432124720u,803643432u,1633613396u,2672665246u,3170194367u,2147483648u,3221225472u,2684354560u,3489660928u,1476395008u,2483027968u,1040187392u,3808428032u,3196059648u,599785472u,505413632u,4077912064u,1182269440u,1736704000u,2017853440u,2221342720u,3329785856u,2810494976u,3628507136u,1416089600u,2658719744u,864310272u,3863387648u,3076993792u,553150080u,272922560u,4167467040u,1148698640u,1719673080u,2009075780u,2149644390u,3222291575u,2147483648u,1073741824u,2684354560u,1342177280u,2281701376u,1946157056u,436207616u,2566914048u,2625634304u,3208642560u,2720006144u,2098200576u,111673344u,2354315264u,3464626176u,4027383808u,2886631424u,3770826752u,1691164672u,3357462528u,1993345024u,3752330240u,873073152u,2870150400u,1700563072u,87021376u,1097028000u,1222351248u,1560027592u,2977959924u,23268898u,437609937u
+};
+
+// 格林码 
+uint grayCode(uint i) {
+	return i ^ (i>>1);
+}
+
+// 生成第 d 维度的第 i 个 sobol 数
+float sobol(uint d, uint i) {
+    uint result = 0;
+    uint offset = d * 32;
+    for(uint j = 0; i!=0; i >>= 1, j++) 
+        if((i & 1)!=0)
+            result ^= V[j+offset];
+
+    return float(result) * (1.0f/float(0xFFFFFFFFU));
+}
+
+// 生成第 i 帧的第 b 次反弹需要的二维随机向量
+vec2 sobolVec2(float i, uint b) {
+    float u = sobol(b*2, grayCode(int(i)));
+    float v = sobol(b*2+1, grayCode(int(i)));
+    return vec2(u, v);
+}
+vec2 CranleyPattersonRotation(vec2 p) {
+    uint pseed = uint(
+        uint(gl_GlobalInvocationID.x)  * uint(1973) + 
+        uint(gl_GlobalInvocationID.y) * uint(9277) + 
+        uint(114514/1919) * uint(26699)) | uint(1);
+    
+    float u = float(wang_hash(pseed)) / 4294967296.0;
+    float v = float(wang_hash(pseed)) / 4294967296.0;
+
+    p.x += u;
+    if(p.x>1) p.x -= 1;
+    if(p.x<0) p.x += 1;
+
+    p.y += v;
+    if(p.y>1) p.y -= 1;
+    if(p.y<0) p.y += 1;
+
+    return p;
+}
+float sqr(float x) { 
+    return x*x; 
+}
+float SchlickFresnel(float u) {
+    float m = clamp(1-u, 0, 1);
+    float m2 = m*m;
+    return m2*m2*m; // pow(m,5)
+}
+
+float GTR2(float a,float NdotH) {
+    float a2 = a*a;
+    float t = 1 + (a2-1)*NdotH*NdotH;
+    return a2 / (PI * t*t);
+}
+float smithG_GGX(float NdotV, float alphaG) {
+    float a = alphaG*alphaG;
+    float b = NdotV*NdotV;
+    return 1 / (NdotV + sqrt(a + b - a*b));
+}
+
+
+
+vec3 BRDF_Evaluate(vec3 V, vec3 N, vec3 L, in Material material) {
+    float NdotL = dot(N, L);
+    float NdotV = dot(N, V);
+    if(NdotL < 0 || NdotV < 0) return vec3(0);
+
+    vec3 H = normalize(L + V);
+    float NdotH = dot(N, H);
+    float LdotH = dot(L, H);
+
+    // 各种颜色
+    vec3 Cdlin = material.baseColor;
+
+    vec3 Cspec0 = mix(vec3(0.08), Cdlin, material.metallic); // 0° 镜面反射颜色
+
+
+    // 漫反射
+    float Fd90 = 0.5 + 2.0 * LdotH * LdotH * material.roughness;
+    float FL = SchlickFresnel(NdotL);
+    float FV = SchlickFresnel(NdotV);
+    float Fd = mix(1.0, Fd90, FL) * mix(1.0, Fd90, FV);
+
+
+     
+    // 镜面反射 -- 各向同性
+    float alpha = max(0.001, sqr(material.roughness));
+    float Ds = GTR2(alpha,NdotH);
+    float FH = SchlickFresnel(LdotH);
+    vec3 Fs = mix(Cspec0, vec3(1), FH);
+    float Gs = smithG_GGX(NdotL, material.roughness);
+    Gs *= smithG_GGX(NdotV, material.roughness);   
+    vec3 diffuse = (1.0/PI) * Fd * Cdlin ;
+    vec3 specular = Gs * Fs * Ds;
+    return diffuse * (1.0 - material.metallic) + specular;
+}
+
+
+
+//采样
+// 半球均匀采样
+vec3 SampleHemisphere() {
+    float z = rand();
+    float r = max(0, sqrt(1.0 - z*z));
+    float phi = 2.0 * PI * rand();
+    return vec3(r * cos(phi), r * sin(phi), z);
+}
+// 将向量 v 投影到 N 的法向半球
+vec3 toNormalHemisphere(vec3 v, vec3 N) {
+    vec3 helper = vec3(1, 0, 0);
+    if(abs(N.x)>0.999) helper = vec3(0, 0, 1);
+    vec3 tangent = normalize(cross(N, helper));
+    vec3 bitangent = normalize(cross(N, tangent));
+    return v.x * tangent + v.y * bitangent + v.z * N;
+}
+// 余弦加权的法向半球采样
+vec4 SampleCosineHemisphere(float xi_1, float xi_2, vec3 N) {
+    // 均匀采样 xy 圆盘然后投影到 z 半球
+    float r = sqrt(xi_1);
+    float theta = xi_2 * 2.0 * PI;
+    float x = r * cos(theta);
+    float y = r * sin(theta);
+    float z = sqrt(1.0 - x*x - y*y);
+
+    // 从 z 半球投影到法向半球
+    vec3 L = toNormalHemisphere(vec3(x, y, z), N);
+    float NdotL = dot(N, L);
+    return vec4(L,NdotL/PI);
+}
+// GTR2 重要性采样
+vec3 SampleGTR2(float xi_1, float xi_2, vec3 V, vec3 N, float alpha) {
+    
+    float phi_h = 2.0 * PI * xi_1;
+    float sin_phi_h = sin(phi_h);
+    float cos_phi_h = cos(phi_h);
+
+    float cos_theta_h = sqrt((1.0-xi_2)/(1.0+(alpha*alpha-1.0)*xi_2));
+    float sin_theta_h = sqrt(max(0.0, 1.0 - cos_theta_h * cos_theta_h));
+
+    // 采样 "微平面" 的法向量 作为镜面反射的半角向量 h 
+    vec3 H = vec3(sin_theta_h*cos_phi_h, sin_theta_h*sin_phi_h, cos_theta_h);
+    H = toNormalHemisphere(H, N);   // 投影到真正的法向半球
+
+    // 根据 "微法线" 计算反射光方向
+    vec3 L = reflect(-V, H);
+
+    return L;
+}
+
+
+
+vec4 SampleBRDF(float xi_1, float xi_2, float xi_3, vec3 V, vec3 N, in Material material){
+
+    
+    // 按照概率采样
+    float rd = xi_3;
+    if(rd<(0.5 * (1.0 - material.metallic))){
+        return SampleCosineHemisphere(xi_1,xi_2,N);
+
+
+
+    }else{
+
+        float alpha_GTR2 = max(0.001, sqr(material.roughness));
+        vec3 L = SampleGTR2(xi_1, xi_2, V, N, alpha_GTR2);
+
+
+
+
+        vec3 H = normalize(L + V);
+        float NdotH = dot(N, H);
+
+
+         float Ds = GTR2(alpha_GTR2,NdotH); 
+         float pdf_specular = Ds * NdotH / (4.0 * dot(L, H));
+
+
+       
+        //return vec4(L,HwithPDF.a);
+        return  vec4(L,pdf_specular);
+        
+
+    }
+        
+
+}
+
+
+
+
+//hdr
+// 将三维向量 v 转为 HDR map 的纹理坐标 uv
+vec2 SampleSphericalMap(vec3 v) {
+    vec2 uv = vec2(atan(v.z, v.x), asin(v.y));
+    uv /= vec2(2.0 * PI, PI);
+    uv += 0.5;
+    uv.y = 1.0 - uv.y;
+    return uv;
+}
+
+// 获取 HDR 环境颜色
+vec3 sampleHdr(vec3 v) {
+    vec2 uv = SampleSphericalMap(normalize(v));
+    vec3 color = texture2D(hdrMap, uv).rgb;
+    color = min(color, vec3(10));
+    return color;
+}
+
+//光源重要性采样
+// 采样预计算的 HDR cache
+vec3 SampleHdrDirections(float xi_1, float xi_2) {
+    vec2 xy = texture2D(hdrCache, vec2(xi_1, xi_2)).rg; // x, y
+    xy.y = 1.0 - xy.y; // flip y
+
+    // 获取角度
+    float phi = 2.0 * PI * (xy.x - 0.5);    // [-pi ~ pi]
+    float theta = PI * (xy.y - 0.5);        // [-pi/2 ~ pi/2]   
+
+    // 球坐标计算方向
+    vec3 L = vec3(cos(theta)*cos(phi), sin(theta), cos(theta)*sin(phi));
+
+    return L;
+}
+float hdrPdf(vec3 L, int hdrResolution) {
+    vec2 uv = SampleSphericalMap(normalize(L));   // 方向向量转 uv 纹理坐标
+
+    float pdf = texture2D(hdrCache, uv).b;      // 采样概率密度
+    float theta = PI * (0.5 - uv.y);            // theta 范围 [-pi/2 ~ pi/2]
+    float sin_theta = max(sin(theta), 1e-10);
+
+    // 球坐标和图片积分域的转换系数
+    float p_convert = float(2048.0*1024.0 / 2) / (2.0 * PI * PI * sin_theta);  
+    
+    return pdf * p_convert;
+}
+
+
+
+
+//vec3 BRDF_Evaluate(vec3 V, vec3 N, vec3 L,in Material material) {
+//
+//
+//
+//        float NdotL = dot(N, L);
+//    float NdotV = dot(N, V);
+//    if(NdotL < 0 ) return vec3(1);
+//    if( NdotV < 0) return vec3(0);
+//    vec3 H = normalize(L + V);
+//    float NdotH = dot(N, H);
+//    float LdotH = dot(L, H);
+//
+//    vec3 Cdlin = material.baseColor;
+//	
+//	// 漫反射
+//	float Fd90 = 0.5 + 2.0 * LdotH * LdotH * material.roughness;
+//	float FL = SchlickFresnel(NdotL);
+//	float FV = SchlickFresnel(NdotV);
+//	float Fd = mix(1.0, Fd90, FL) * mix(1.0, Fd90, FV);
+//	
+//	vec3 diffuse = Fd * Cdlin / PI;
+//
+//float Cdlum = 0.3 * Cdlin.r + 0.6 * Cdlin.g  + 0.1 * Cdlin.b;
+//vec3 Ctint = (Cdlum > 0) ? (Cdlin/Cdlum) : (vec3(1));
+//
+//    vec3 Cspec = 0.5 * mix(vec3(1), Ctint, 0.0);
+//    vec3 Cspec0 = mix(0.08*Cspec, Cdlin, material.metallic); // 0° 镜面反射颜色
+//
+//    float alpha = material.roughness * material.roughness;
+//	float Ds = GTR2(NdotH, alpha);
+//	float FH = SchlickFresnel(LdotH);
+//	vec3 Fs = mix(Cspec0, vec3(1), FH);
+//	float Gs = smithG_GGX(NdotL, material.roughness);
+//	Gs *= smithG_GGX(NdotV, material.roughness);
+//	
+//	vec3 specular = Gs * Fs * Ds;
+//
+//	return diffuse  * (1.0 - material.metallic)+specular;
+//}
+
+
+
+
+
+
+
+
+//光线与场景求交
+HitResult HitTriangle(Triangle triangle,Ray ray){
+    HitResult res;
+    res.dis = INF;
+    res.isHit = false;
+    res.isInside = false;
+    res.hitPoint = vec3(0);
+    res.normal = vec3(0);
+    vec3 p1 = triangle.p1withTriangleID.xyz;
+    vec3 p2 = triangle.p2withTriangleID.xyz;
+    vec3 p3 = triangle.p3withTriangleID.xyz;
+
+    vec3 S = ray.startPoint;
+    vec3 d = ray.direction;
+    vec3 N = normalize(cross(p2-p1,p3-p1));
+
+    if(dot(d,N)>0.0f){
+        N = -N;
+        res.isInside = true;
+        
+     }
+    if (abs(dot(N, d)) < 0.00001f) return res;
+        // 距离
+    float t = (dot(N, p1) - dot(S, N)) / dot(d, N);
+    if (t < 0.0005f) return res;    // 如果三角形在光线背面
+
+    // 交点计算
+    vec3 P = S + d * t;
+
+    // 判断交点是否在三角形中
+    vec3 c1 = cross(p2 - p1, P - p1);
+    vec3 c2 = cross(p3 - p2, P - p2);
+    vec3 c3 = cross(p1 - p3, P - p3);
+    bool r1 = (dot(c1, N) > 0 && dot(c2, N) > 0 && dot(c3, N) > 0);
+    bool r2 = (dot(c1, N) < 0 && dot(c2, N) < 0 && dot(c3, N) < 0);
+
+    // 命中，封装返回结果
+    if (r1 || r2) {
+        res.isHit = true;
+        res.hitPoint = P;
+        res.dis = t;
+        res.normal = N;
+        res.viewDir = d;
+        // 根据交点位置插值顶点法线
+        float alpha = (-(P.x-p2.x)*(p3.y-p2.y) + (P.y-p2.y)*(p3.x-p2.x)) / (-(p1.x-p2.x-0.00005)*(p3.y-p2.y+0.00005) + (p1.y-p2.y+0.00005)*(p3.x-p2.x+0.00005));
+        float beta  = (-(P.x-p3.x)*(p1.y-p3.y) + (P.y-p3.y)*(p1.x-p3.x)) / (-(p2.x-p3.x-0.00005)*(p1.y-p3.y+0.00005) + (p2.y-p3.y+0.00005)*(p1.x-p3.x+0.00005));
+        float gama  = 1.0 - alpha - beta;
+        vec3 Nsmooth = alpha * triangle.n1withMaterialID.xyz + beta * triangle.n1withMaterialID.xyz + gama * triangle.n1withMaterialID.xyz;
+        Nsmooth = normalize(Nsmooth);
+        res.normal = (res.isInside) ? (-Nsmooth) : (Nsmooth);
+    }
+    return res;
+
+}
+HitResult HitTriangleArray(int l,int r,Ray ray){
+    HitResult res;
+    res.isHit = false;
+    res.dis = INF;
+    res.hitPoint = vec3(0);
+    res.normal = vec3(0);
+    for(int i = l;i<=r;i++){
+    
+        HitResult r = HitTriangle(ts[i],ray);
+
+        if(r.isHit&&r.dis<res.dis){
+            res = r;
+            res.material = materialArray[int(ts[i].n1withMaterialID.a)];
+        
+        }
+    
+    }
+    return res;
+
+}
+float HitAABB(vec3 AA,vec3 BB,Ray ray){
+
+    vec3 invDir = 1.0/ray.direction;
+
+    vec3 far = (BB-ray.startPoint)*invDir;
+    vec3 near = (AA-ray.startPoint)*invDir;
+
+    vec3 tmax = max(far,near);
+    vec3 tmin = min(far,near);
+
+    float t1 = min(tmax.x,min(tmax.y,tmax.z));
+
+    float t0 = max(tmin.x,max(tmin.y,tmin.z));
+
+    return (t1 >= t0) ? ((t0 > 0.0) ? (t0) : (t1)) : (-1);
+
+
+
+}
+HitResult HitBVH(Ray ray){
+    HitResult res;
+    res.isHit = false;
+    res.dis = INF;
+    res.hitPoint = vec3(0);
+    res.normal = vec3(0);
+    int stack[256];
+
+    int sp = 0;
+
+    stack[sp++] = 0;
+
+    while(sp>0){
+    
+        int top = stack[--sp];
+
+        BVHNode node = bvh[top];
+
+        if(node.n>0){
+        
+            HitResult temp = HitTriangleArray(node.index,node.index+node.n-1,ray);
+
+            if(temp.isHit&&temp.dis<res.dis){
+            
+                res = temp;
+            }
+            continue;
+        
+        }
+
+        float d1 = INF;
+        float d2 = INF;
+
+        if(node.left>0){
+            
+            d1 = HitAABB(bvh[node.left].AA.xyz,bvh[node.left].BB.xyz,ray);
+        }
+        if(node.right>0){
+        
+            d2 = HitAABB(bvh[node.right].AA.xyz,bvh[node.right].BB.xyz,ray);
+        }
+
+        if(d1>0&&d2>0){
+            if(d1>=d2){
+                stack[sp++] = node.left;
+                stack[sp++] = node.right;
+            
+            }else{
+                stack[sp++] = node.right;
+                stack[sp++] = node.left;
+            }
+        
+        }else if(d1>0){
+        
+            stack[sp++] = node.left;
+        
+        }else if(d2>0){
+            stack[sp++] = node.right;
+        
+        }
+    
+    
+    }
+    return res;
+
+}
+vec3 pathTracing(HitResult hit, int maxBounce) {
+    vec3 Lo = vec3(0);      // 最终的颜色
+    vec3 history = vec3(1); // 递归积累的颜色
+
+    for(int bounce=0; bounce<maxBounce; bounce++) {
+        vec3 V = -hit.viewDir;
+        vec3 N = hit.normal;
+        vec3 L = toNormalHemisphere(SampleHemisphere(), hit.normal);    // 随机出射方向 wi
+        float pdf = 1.0 / (2.0 * PI);                                   // 半球均匀采样概率密度
+        float cosine_o = max(0, dot(V, N));                             // 入射光和法线夹角余弦
+        float cosine_i = max(0, dot(L, N));                             // 出射光和法线夹角余弦
+        vec3 f_r = BRDF_Evaluate(V, N, L, hit.material);
+
+        // 漫反射: 随机发射光线
+        Ray randomRay;
+        randomRay.startPoint = hit.hitPoint;
+        randomRay.direction = L;
+        HitResult newHit = HitBVH(randomRay);
+
+        // 未命中
+        if(!newHit.isHit) {
+            vec3 skyColor = sampleHdr(randomRay.direction);
+            Lo += history*f_r ;
+            //Lo += vec3(1.0);
+            break;
+        }
+        
+        // 命中光源积累颜色
+        vec3 Le = newHit.material.emissive;
+        Lo += history * Le * f_r * cosine_i / pdf;
+        
+        // 递归(步进)
+        hit = newHit;
+        history *= f_r * cosine_i / pdf;  // 累积颜色
+    }
+    
+    return Lo;
+}
+
+
+vec3 ImportantSamplingPathTracing(HitResult hit, int maxBounce){
+        vec3 Lo = vec3(0);      // 最终的颜色
+        vec3 history = vec3(1); // 递归积累的颜色
+
+        for(int bounce=0; bounce<maxBounce; bounce++){
+        
+            vec3 V = -hit.viewDir;
+            vec3 N = hit.normal; 
+                        vec2 uv = sobolVec2(frameCounter+1, 0);
+            uv = CranleyPattersonRotation(uv);
+            float xi_1 = uv.x;
+            float xi_2 = uv.y;
+            float xi_3 = rand();    // xi_3 是决定采样的随机数, 朴素 rand 就好
+
+            vec4 LwithPDF = SampleBRDF(xi_1, xi_2, xi_3, V, N, hit.material); 
+
+            vec3 L = LwithPDF.rgb;
+
+            vec3 f_r = BRDF_Evaluate(V, N, LwithPDF.rgb, hit.material);
+
+            float brdf_pdf = LwithPDF.a;
+
+            
+            float NdotL = dot(N, LwithPDF.rgb);
+
+            Ray brdfRay;
+
+            brdfRay.startPoint = hit.hitPoint;
+
+            brdfRay.direction = L;
+
+            Ray shadowRay;
+            shadowRay.startPoint = hit.hitPoint;
+            shadowRay.direction = SampleHdrDirections(rand(), rand());
+
+                    // 进行一次求交测试 判断是否有遮挡
+            if(dot(N, shadowRay.direction) > 0.0) { // 如果采样方向背向点 p 则放弃测试, 因为 N dot L < 0            
+                HitResult hdrHit = HitBVH(shadowRay);
+            
+                // 天空光仅在没有遮挡的情况下积累亮度
+                if(!hdrHit.isHit) {
+                    // 获取采样方向 L 上的: 1.光照贡献, 2.环境贴图在该位置的 pdf, 3.BRDF 函数值, 4.BRDF 在该方向的 pdf
+                    vec3 L = shadowRay.direction;
+                    vec3 color = sampleHdr(L);
+                    float pdf_light = hdrPdf(L, hdrResolution);
+                    vec3 f_r = BRDF_Evaluate(V, N, L, hit.material);
+                   
+                
+                    // 多重重要性采样
+                    float mis_weight = misMixWeight(pdf_light, brdf_pdf);
+                    Lo += mis_weight * history * color * f_r * dot(N, L) / pdf_light;
+                    //Lo += history * color * f_r * dot(N, L) / pdf_light;   // 尝龟
+                }
+            }
+
+
+
+
+
+
+
+
+
+
+
+
+            HitResult newHit = HitBVH(brdfRay);
+
+
+            if(!newHit.isHit){
+                float pdf_light = hdrPdf(L, hdrResolution);            
+            
+                    // 多重重要性采样
+                float mis_weight = misMixWeight(brdf_pdf, pdf_light);   // f(a,b) = a^2 / (a^2 + b^2)
+                Lo+=history*sampleHdr(brdfRay.direction)*f_r*(NdotL)/brdf_pdf;
+                break;
+            }
+                    // 命中光源积累颜色
+            vec3 Le = newHit.material.emissive;
+            Lo += history * Le * f_r * NdotL / brdf_pdf;
+
+                    // 递归(步进)
+            hit = newHit;
+            history *= f_r * NdotL / brdf_pdf;  // 累积颜色
+
+
+        }
+
+        return Lo;
+}
+void main(){
+
+
+
+
+    vec4 hitPos = texture(PositionWithDepth,gl_GlobalInvocationID.xy/512.0);
+    vec4 hitNormal = texture(NormalWithMaterial,gl_GlobalInvocationID.xy/512.0);
+    
+    
+    HitResult firstHit ;
+    firstHit.hitPoint = hitPos.xyz;
+    firstHit.material = materialArray[int(hitNormal.a)];
+    firstHit.normal = normalize(hitNormal.xyz);
+    firstHit.viewDir = normalize(hitPos.xyz-eye);
+    
+    vec3 Le = vec3(0);
+    vec3 L_dir = vec3(0);
+    vec3 L_indir = vec3(0);
+    
+    vec3 color = vec3(0);
+    if(hitPos!=vec4(0,0,0,1.0)){
+
+           L_dir = ImportantSamplingPathTracing(firstHit,2);
+
+        
+        imageStore(frameTexture,ivec2(gl_GlobalInvocationID.xy),vec4( L_dir,1.0));
+       
+    
+    
+    
+    }else{//采样天空信息
+    
+        vec3 ndc = vec3(gl_GlobalInvocationID.xy/512.0,0.0);
+        ndc = ndc*2.0-1.0;
+
+        vec4 pos = inverse(u_projection*u_view)*vec4(ndc,1.0);
+        pos.xyz/=pos.w;
+
+        vec3 dir = pos.xyz-eye;
+
+        color = sampleHdr(dir);
+        imageStore(frameTexture,ivec2(gl_GlobalInvocationID.xy),vec4(color,0.0));
+
+    
+    }
+   
+
+
+}
